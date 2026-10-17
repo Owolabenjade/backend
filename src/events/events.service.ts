@@ -22,7 +22,8 @@ import { CACHE_STORE } from '../common/cache/cache-store';
 import { Inject } from '@nestjs/common';
 
 /** On-chain existence derived from `StellarService.getEvent`, reported alongside the cached DB `status` when reconciliation is requested. */
-export type OnChainReconciliationStatus = 'PUBLISHED' | 'NOT_FOUND' | 'NOT_PUBLISHED';
+export type OnChainReconciliationStatus =
+  'PUBLISHED' | 'NOT_FOUND' | 'NOT_PUBLISHED';
 
 @Injectable()
 export class EventsService {
@@ -116,7 +117,8 @@ export class EventsService {
     if (event.status !== EventStatus.DRAFT) {
       throw new BadRequestException('Only draft events can be published');
     }
-    if (event.chainEventId !== null) {
+    // #381 — an expired, unconfirmed reservation no longer blocks publishing.
+    if (event.publishedTxHash !== null || this.hasPendingReservation(event)) {
       throw new BadRequestException(
         'This event already has a pending or confirmed on-chain id',
       );
@@ -131,7 +133,7 @@ export class EventsService {
       );
     }
 
-    const chainEventId = await this.reserveChainEventId(eventId);
+    const chainEventId = await this.reserveChainEventId(event);
     const unsignedXdr = await this.stellar.buildCreateEventTx({
       organizerPublicKey: event.organization.stellarAccount,
       chainEventId,
@@ -147,6 +149,11 @@ export class EventsService {
   async confirmPublish(userId: string, eventId: string, signedXdr: string) {
     const event = await this.getWithOrg(eventId);
     await this.organizations.assertMember(event.organizationId, userId);
+    // #382 — refuse before any network call, so a published event can't
+    // relay a second `create_event` or have its status rewritten.
+    if (event.status !== EventStatus.DRAFT) {
+      throw new ConflictException('Only draft events can be published');
+    }
     if (event.chainEventId === null) {
       throw new BadRequestException('Call publish before confirm-publish');
     }
@@ -348,14 +355,50 @@ export class EventsService {
     return { total, byStatus };
   }
 
-  /** Picks a random u64 (well within Postgres's signed-bigint range) and reserves it on the event row. */
-  private async reserveChainEventId(eventId: string): Promise<bigint> {
+  /**
+   * #381 — a reservation is pending while the envelope built for it is
+   * inside its time bound (`StellarService.buildTxTimeoutSeconds`). After
+   * that the network rejects the envelope (`txTOO_LATE`), so it can never
+   * land and the reservation is free to take over.
+   */
+  private hasPendingReservation(event: {
+    chainEventId: bigint | null;
+    chainEventIdReservedAt: Date | null;
+  }): boolean {
+    if (event.chainEventId === null || event.chainEventIdReservedAt === null) {
+      return false;
+    }
+    const expiresAt =
+      event.chainEventIdReservedAt.getTime() +
+      this.stellar.buildTxTimeoutSeconds * 1000;
+    return Date.now() < expiresAt;
+  }
+
+  /**
+   * Reserves the event's on-chain id and stamps the reservation time. An
+   * abandoned reservation (#381) is reused rather than replaced: the
+   * contract rejects a second `create_event` for one id
+   * (`EventAlreadyExists`), so reuse can never register the event twice.
+   * Otherwise picks a random u64 (well within Postgres's signed-bigint range).
+   */
+  private async reserveChainEventId(event: {
+    id: string;
+    chainEventId: bigint | null;
+  }): Promise<bigint> {
+    const chainEventIdReservedAt = new Date();
+    if (event.chainEventId !== null) {
+      await this.prisma.event.update({
+        where: { id: event.id },
+        data: { chainEventIdReservedAt },
+      });
+      return event.chainEventId;
+    }
     for (let attempt = 0; attempt < 5; attempt++) {
       const candidate = randomBytes(6).readUIntBE(0, 6); // 48 bits — Buffer#readUIntBE caps at 6 bytes
       try {
         await this.prisma.event.update({
-          where: { id: eventId },
-          data: { chainEventId: BigInt(candidate) },
+          where: { id: event.id },
+          data: { chainEventId: BigInt(candidate), chainEventIdReservedAt },
         });
         return BigInt(candidate);
       } catch (err) {

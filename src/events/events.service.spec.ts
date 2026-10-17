@@ -28,6 +28,7 @@ describe('EventsService', () => {
   };
   let organizations: { assertMember: jest.Mock; findOne: jest.Mock };
   let stellar: {
+    buildTxTimeoutSeconds: number;
     buildCreateEventTx: jest.Mock;
     submitSignedTransaction: jest.Mock;
     getEvent: jest.Mock;
@@ -67,6 +68,7 @@ describe('EventsService', () => {
       }),
     };
     stellar = {
+      buildTxTimeoutSeconds: 300,
       buildCreateEventTx: jest.fn().mockResolvedValue('unsigned-xdr'),
       submitSignedTransaction: jest
         .fn()
@@ -112,7 +114,7 @@ describe('EventsService', () => {
           data: expect.objectContaining({
             maxResaleMultiplierBps: 11_000,
             royaltyBps: 500,
-          }),
+          }) as never,
         }),
       );
       expect(prisma.ticketType.createMany).not.toHaveBeenCalled();
@@ -144,7 +146,7 @@ describe('EventsService', () => {
           data: expect.objectContaining({
             maxResaleMultiplierBps: 12_000,
             royaltyBps: 500,
-          }),
+          }) as never,
         }),
       );
     });
@@ -161,9 +163,7 @@ describe('EventsService', () => {
         category: 'CONCERTS',
         venue: 'O2 Arena',
         startsAt: new Date(),
-        ticketTypes: [
-          { name: 'General', price: '1000', quantityTotal: 100 },
-        ],
+        ticketTypes: [{ name: 'General', price: '1000', quantityTotal: 100 }],
       } as never);
 
       expect(prisma.$transaction).toHaveBeenCalled();
@@ -191,9 +191,7 @@ describe('EventsService', () => {
           category: 'CONCERTS',
           venue: 'O2 Arena',
           startsAt: new Date(),
-          ticketTypes: [
-            { name: 'General', price: '1000', quantityTotal: 100 },
-          ],
+          ticketTypes: [{ name: 'General', price: '1000', quantityTotal: 100 }],
         } as never),
       ).rejects.toThrow('duplicate ticket type name');
     });
@@ -217,13 +215,14 @@ describe('EventsService', () => {
       expect(stellar.buildCreateEventTx).not.toHaveBeenCalled();
     });
 
-    it('refuses to re-publish an event that already reserved an on-chain id', async () => {
+    it('refuses to re-publish while an earlier reservation could still land', async () => {
       prisma.event.findUnique.mockResolvedValue({
         ...createEvent({
           id: 'event-1',
           organizationId: 'org-1',
           status: 'DRAFT',
           chainEventId: 99n,
+          chainEventIdReservedAt: new Date(),
         }),
         organization: createOrganization({ stellarAccount: 'GORG' }),
       });
@@ -231,6 +230,79 @@ describe('EventsService', () => {
       await expect(
         service.buildPublishTx('organizer-1', 'event-1'),
       ).rejects.toBeInstanceOf(BadRequestException);
+      expect(stellar.buildCreateEventTx).not.toHaveBeenCalled();
+    });
+
+    it('refuses to re-publish an event whose create_event was already confirmed', async () => {
+      // An unpublished event is DRAFT again but still registered on-chain.
+      prisma.event.findUnique.mockResolvedValue({
+        ...createEvent({
+          id: 'event-1',
+          organizationId: 'org-1',
+          status: 'DRAFT',
+          chainEventId: 99n,
+          publishedTxHash: '0xabc',
+        }),
+        organization: createOrganization({ stellarAccount: 'GORG' }),
+      });
+
+      await expect(
+        service.buildPublishTx('organizer-1', 'event-1'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(stellar.buildCreateEventTx).not.toHaveBeenCalled();
+    });
+
+    describe('abandoned signing (#381)', () => {
+      beforeEach(() => {
+        jest.useFakeTimers({ now: new Date('2026-10-18T12:00:00.000Z') });
+      });
+      afterEach(() => {
+        jest.useRealTimers();
+      });
+
+      it('lets a second attempt reuse the reservation once its envelope expired', async () => {
+        const draft = {
+          ...createEvent({
+            id: 'event-1',
+            organizationId: 'org-1',
+            status: 'DRAFT',
+          }),
+          organization: createOrganization({ stellarAccount: 'GORG' }),
+        };
+        prisma.event.findUnique.mockResolvedValue(draft);
+        prisma.event.update.mockResolvedValue({});
+
+        // First attempt reserves an id; the organizer never signs.
+        await service.buildPublishTx('organizer-1', 'event-1');
+        const [[{ data: reservation }]] = prisma.event.update.mock.calls as [
+          [{ data: { chainEventId: bigint; chainEventIdReservedAt: Date } }],
+        ];
+        const reservedId = reservation.chainEventId;
+        prisma.event.findUnique.mockResolvedValue({ ...draft, ...reservation });
+
+        // Within the envelope's time bound the reservation still blocks.
+        jest.advanceTimersByTime(299_000);
+        await expect(
+          service.buildPublishTx('organizer-1', 'event-1'),
+        ).rejects.toBeInstanceOf(BadRequestException);
+
+        // Past it, the second attempt succeeds with the same id.
+        jest.advanceTimersByTime(2_000);
+        const { unsignedXdr } = await service.buildPublishTx(
+          'organizer-1',
+          'event-1',
+        );
+
+        expect(unsignedXdr).toBe('unsigned-xdr');
+        expect(stellar.buildCreateEventTx).toHaveBeenCalledTimes(2);
+        expect(stellar.buildCreateEventTx).toHaveBeenLastCalledWith(
+          expect.objectContaining({ chainEventId: reservedId }),
+        );
+        expect(prisma.event.update).toHaveBeenLastCalledWith({
+          where: { id: 'event-1' },
+          data: { chainEventIdReservedAt: new Date() },
+        });
+      });
     });
 
     it('returns conflict when the event has no ticket types to sell', async () => {
@@ -310,6 +382,31 @@ describe('EventsService', () => {
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
+    it('returns conflict for an already-published event without touching the network (#382)', async () => {
+      prisma.event.findUnique.mockResolvedValue({
+        ...createEvent({
+          id: 'event-1',
+          organizationId: 'org-1',
+          status: 'PUBLISHED',
+          chainEventId: 99n,
+          publishedTxHash: '0xabc',
+        }),
+        organization: createOrganization({ stellarAccount: 'GORG' }),
+      });
+
+      const attempt = service.confirmPublish(
+        'organizer-1',
+        'event-1',
+        'signed-xdr',
+      );
+
+      await expect(attempt).rejects.toBeInstanceOf(ConflictException);
+      await expect(attempt).rejects.toMatchObject({ status: 409 });
+      expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+      expect(stellar.getEvent).not.toHaveBeenCalled();
+      expect(prisma.event.update).not.toHaveBeenCalled();
+    });
+
     it('rejects a confirmed transaction whose on-chain event does not match', async () => {
       prisma.event.findUnique.mockResolvedValue({
         ...createEvent({
@@ -370,6 +467,7 @@ describe('EventsService', () => {
       prisma.event.findUnique.mockResolvedValue({
         id: 'event-1',
         organizationId: 'org-1',
+        status: 'DRAFT',
         chainEventId: 99n,
         organization: { stellarAccount: 'GORG' },
       });

@@ -145,6 +145,10 @@ model Event {
   /// The `event_id` (u64) this event was registered under on the ticketing
   /// contract via `create_event`. Null until the on-chain call succeeds.
   chainEventId           BigInt?         @unique
+  /// #381 — when `chainEventId` was last reserved by a publish build. An
+  /// unconfirmed reservation expires with its envelope's time bound and is
+  /// then reused by the next publish attempt.
+  chainEventIdReservedAt DateTime?
   publishedTxHash        String?
   maxResaleMultiplierBps Int             @default(11000)
   royaltyBps             Int             @default(500)

@@ -559,8 +559,11 @@ Returns the ticket type row.
 
 Members only. Build step: reserves a `chainEventId` and returns the
 unsigned `create_event` envelope for the organization's Stellar account
-to sign. `400` unless the event is a `DRAFT` without a chain id, `409`
-until it has at least one ticket type.
+to sign. `400` unless the event is a `DRAFT` that was never confirmed
+on-chain and has no pending reservation, `409` until it has at least one
+ticket type. A reservation stays pending for the envelope's time bound
+(`TRANSACTION_BUILD_TIMEOUT_SECONDS`); if it was never confirmed, the next
+call reuses the same `chainEventId` and returns a fresh envelope.
 
 ```bash
 curl -s -X POST "$API/v1/events/7a1f3c5e-9b2d-4e6f-8a0c-1d2e3f4a5b6c/publish" -H "Authorization: Bearer $TOKEN"
@@ -574,7 +577,8 @@ curl -s -X POST "$API/v1/events/7a1f3c5e-9b2d-4e6f-8a0c-1d2e3f4a5b6c/publish" -H
 
 Members only. Relays the signed envelope, reads the event back from the
 contract to confirm the id and organizer match, then sets
-`status: PUBLISHED` and `publishedTxHash`.
+`status: PUBLISHED` and `publishedTxHash`. `409` before anything is
+submitted unless the event is still a `DRAFT`.
 
 | field | type | rules |
 |---|---|---|
@@ -917,7 +921,10 @@ curl -s "$API/v1/tickets/by-chain/7" -H "Authorization: Bearer $TOKEN"
 Gate verification (members only, rate limited per `SCAN_RATE_LIMIT_*`,
 `429` when exceeded). Reads the ticket from the contract, reconciles the
 cached status, and falls back to the cached row with `stale: true` when
-Soroban RPC is unreachable.
+Soroban RPC is unreachable. `ownerMismatch` is `true` when the recorded
+owner's wallet is not `onChainOwner`; the owner is then reconciled to the
+account holding that wallet, if there is one, and `ownerName` names them.
+It is `false` when `stale` is `true`, since there is nothing to compare.
 
 ```bash
 curl -s "$API/v1/tickets/verify/c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f" -H "Authorization: Bearer $TOKEN"
@@ -932,6 +939,7 @@ curl -s "$API/v1/tickets/verify/c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f" -H "Author
   "ownerName": "Ada Lovelace",
   "status": "VALID",
   "onChainOwner": "GBAHZWO3UI3GAHPQCPSW6IR5N7HJ4UBRZNAFMSYB6DAKVNHQDOZIV2YJ",
+  "ownerMismatch": false,
   "stale": false
 }
 ```
@@ -1147,7 +1155,9 @@ curl -s -X POST "$API/v1/tickets/6f0a2c4e-8b1d-4f3a-9e5c-7d8e9f0a1b2c/revoke" -H
 #### `POST /v1/tickets/:ticketId/confirm-revoke`
 
 Body is `ConfirmSignedTxDto` (`signedXdr`, optional `txHash`). Returns
-the ticket row with `status: "REVOKED"` and writes an audit entry.
+the ticket row with `status: "REVOKED"` and writes an audit entry. An
+`ACTIVE` resale listing for the ticket is set to `CANCELLED` in the same
+transaction, so it leaves `GET /v1/tickets/resale`.
 
 ```bash
 curl -s -X POST "$API/v1/tickets/6f0a2c4e-8b1d-4f3a-9e5c-7d8e9f0a1b2c/confirm-revoke" \

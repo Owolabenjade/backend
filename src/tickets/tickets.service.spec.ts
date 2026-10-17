@@ -1325,7 +1325,78 @@ describe('TicketsService', () => {
       expect(result.stale).toBe(true);
       expect(result.status).toBe('VALID');
       expect(result.onChainOwner).toBeNull();
+      // #380 — nothing to compare against while the chain is unreachable.
+      expect(result.ownerMismatch).toBe(false);
       // should NOT attempt a DB update when RPC is down
+      expect(prisma.ticket.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('verify — owner mismatch (#380)', () => {
+    const ticketRow = {
+      id: 'ticket-1',
+      ownerId: 'owner-1',
+      chainTicketId: 7n,
+      status: 'VALID',
+      seat: 'A1',
+      event: { organizationId: 'org-1', name: 'Radiohead Live' },
+      owner: { id: 'owner-1', name: 'Ada Lovelace', stellarPublicKey: 'GADA' },
+      ticketType: { name: 'GA' },
+    };
+
+    it('reports no mismatch and writes nothing when the chain agrees', async () => {
+      prisma.ticket.findUnique.mockResolvedValue(ticketRow);
+      stellar.verifyTicket.mockResolvedValue({
+        owner: 'GADA',
+        status: 'Valid',
+      });
+
+      const result = await service.verify('staff-1', 'qr-secret');
+
+      expect(result.ownerMismatch).toBe(false);
+      expect(result.ownerName).toBe('Ada Lovelace');
+      expect(prisma.user.findUnique).not.toHaveBeenCalled();
+      expect(prisma.ticket.update).not.toHaveBeenCalled();
+    });
+
+    it('flags a mismatch and reconciles the owner to the on-chain wallet’s account', async () => {
+      prisma.ticket.findUnique.mockResolvedValue(ticketRow);
+      stellar.verifyTicket.mockResolvedValue({
+        owner: 'GGRACE',
+        status: 'Valid',
+      });
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'owner-2',
+        name: 'Grace Hopper',
+      });
+
+      const result = await service.verify('staff-1', 'qr-secret');
+
+      expect(result.ownerMismatch).toBe(true);
+      expect(result.onChainOwner).toBe('GGRACE');
+      expect(result.ownerName).toBe('Grace Hopper');
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { stellarPublicKey: 'GGRACE' },
+        select: { id: true, name: true },
+      });
+      expect(prisma.ticket.update).toHaveBeenCalledWith({
+        where: { id: 'ticket-1' },
+        data: { ownerId: 'owner-2' },
+      });
+    });
+
+    it('flags a mismatch but keeps the owner when no account holds the on-chain wallet', async () => {
+      prisma.ticket.findUnique.mockResolvedValue(ticketRow);
+      stellar.verifyTicket.mockResolvedValue({
+        owner: 'GUNKNOWN',
+        status: 'Valid',
+      });
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      const result = await service.verify('staff-1', 'qr-secret');
+
+      expect(result.ownerMismatch).toBe(true);
+      expect(result.ownerName).toBe('Ada Lovelace');
       expect(prisma.ticket.update).not.toHaveBeenCalled();
     });
   });
@@ -1655,6 +1726,18 @@ describe('TicketsService', () => {
       expect(result.status).toBe('REVOKED');
     });
 
+    it('cancels the ticket’s ACTIVE resale listing in the same transaction (#379)', async () => {
+      prisma.ticket.findUnique.mockResolvedValue(ticketRow);
+
+      await service.confirmRevoke('organizer-1', 'ticket-1', 'signed-xdr');
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.resaleListing.updateMany).toHaveBeenCalledWith({
+        where: { ticketId: 'ticket-1', status: 'ACTIVE' },
+        data: { status: 'CANCELLED' },
+      });
+    });
+
     it('does not update the ticket when submission fails', async () => {
       prisma.ticket.findUnique.mockResolvedValue(ticketRow);
       stellar.submitSignedTransaction.mockRejectedValueOnce(
@@ -1665,6 +1748,7 @@ describe('TicketsService', () => {
         service.confirmRevoke('organizer-1', 'ticket-1', 'bad-signed-xdr'),
       ).rejects.toThrow('Soroban submission failed');
       expect(prisma.ticket.update).not.toHaveBeenCalled();
+      expect(prisma.resaleListing.updateMany).not.toHaveBeenCalled();
     });
 
     it('requires the caller to be a member of the event organization', async () => {

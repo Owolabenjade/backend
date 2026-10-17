@@ -21,7 +21,11 @@ import {
   TicketTypeSoldOutError,
 } from '../common/errors/domain.error';
 import { OrganizationsService } from '../organizations/organizations.service';
-import { SignedInvocation, StellarService } from '../stellar/stellar.service';
+import {
+  OnChainTicket,
+  SignedInvocation,
+  StellarService,
+} from '../stellar/stellar.service';
 import { AuditService } from '../audit/audit.service';
 import { NotificationService } from '../notifications/notifications.service';
 import { OfflineTokenService } from './offline-token.service';
@@ -316,26 +320,47 @@ export class TicketsService {
 
     // #321 — Graceful degradation: if the Soroban RPC is unavailable, serve
     // the cached DB data with a `stale: true` marker rather than throwing.
-    let reconciledStatus: TicketStatus = ticket.status;
-    let onChainOwner: string | null = null;
-    let stale = false;
-
+    let onChain: OnChainTicket | null = null;
     try {
-      const onChain = await this.stellar.verifyTicket(ticket.chainTicketId);
-      reconciledStatus = onChain.status.toUpperCase() as TicketStatus;
-      onChainOwner = onChain.owner;
-
-      if (reconciledStatus !== ticket.status) {
-        await this.prisma.ticket.update({
-          where: { id: ticket.id },
-          data: { status: reconciledStatus },
-        });
-      }
+      onChain = await this.stellar.verifyTicket(ticket.chainTicketId);
     } catch (err) {
       this.logger.warn(
         `Soroban RPC unavailable during verify (ticketId=${ticket.id}): ${(err as Error).message}. Serving cached data.`,
       );
-      stale = true;
+    }
+
+    let reconciledStatus: TicketStatus = ticket.status;
+    let ownerName = ticket.owner.name;
+    // #380 — the DB owner is only the real holder while their wallet is the
+    // on-chain owner; staff must be warned when the two disagree.
+    let ownerMismatch = false;
+
+    if (onChain) {
+      reconciledStatus = onChain.status.toUpperCase() as TicketStatus;
+      ownerMismatch = ticket.owner.stellarPublicKey !== onChain.owner;
+      // `stellarPublicKey` is unique, so this is a single index lookup. An
+      // on-chain owner with no account here leaves `ownerId` as it is.
+      const chainOwner = ownerMismatch
+        ? await this.prisma.user.findUnique({
+            where: { stellarPublicKey: onChain.owner },
+            select: { id: true, name: true },
+          })
+        : null;
+      if (chainOwner) {
+        ownerName = chainOwner.name;
+      }
+
+      if (reconciledStatus !== ticket.status || chainOwner) {
+        await this.prisma.ticket.update({
+          where: { id: ticket.id },
+          data: {
+            ...(reconciledStatus !== ticket.status && {
+              status: reconciledStatus,
+            }),
+            ...(chainOwner && { ownerId: chainOwner.id }),
+          },
+        });
+      }
     }
 
     return {
@@ -343,10 +368,11 @@ export class TicketsService {
       eventName: ticket.event.name,
       tier: ticket.ticketType.name,
       seat: ticket.seat,
-      ownerName: ticket.owner.name,
+      ownerName,
       status: reconciledStatus,
-      onChainOwner,
-      stale,
+      onChainOwner: onChain?.owner ?? null,
+      ownerMismatch,
+      stale: onChain === null,
     };
   }
 
@@ -447,9 +473,17 @@ export class TicketsService {
   async confirmRevoke(userId: string, ticketId: string, signedXdr: string) {
     const ticket = await this.loadTicketForOrganizer(userId, { id: ticketId });
     await this.stellar.submitSignedTransaction(signedXdr);
-    const revoked = await this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: { status: TicketStatus.REVOKED },
+    const revoked = await this.prisma.$transaction(async (tx) => {
+      // #379 — `revoke_ticket` zeroes the on-chain resale price, so a listing
+      // left ACTIVE would stay in the marketplace yet fail every purchase.
+      await tx.resaleListing.updateMany({
+        where: { ticketId, status: ResaleListingStatus.ACTIVE },
+        data: { status: ResaleListingStatus.CANCELLED },
+      });
+      return tx.ticket.update({
+        where: { id: ticketId },
+        data: { status: TicketStatus.REVOKED },
+      });
     });
     // #209 — audit ticket revocation.
     await this.audit?.record(userId, 'ticket.revoke', 'Ticket', ticketId, {
