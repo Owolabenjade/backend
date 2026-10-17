@@ -11,7 +11,9 @@ import { ConfigService } from '@nestjs/config';
 import {
   EventStatus,
   Prisma,
+  ResaleListing,
   ResaleListingStatus,
+  Ticket,
   TicketStatus,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -31,9 +33,22 @@ import { NotificationService } from '../notifications/notifications.service';
 import { OfflineTokenService } from './offline-token.service';
 import { PromoCodesService } from '../promo-codes/promo-codes.service';
 import { GatesService } from '../gates/gates.service';
+import { FeatureFlagsService } from '../config/feature-flags.service';
 
 /** How long an offline-verifiable token stays valid before a scanner must re-verify online. */
 const OFFLINE_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+
+/** Plain JSON for `ProcessedTx.response`: BigInts become strings, as they do in HTTP responses. */
+function toStoredResponse(value: unknown): Prisma.InputJsonValue {
+  if (value === undefined || value === null) {
+    return Prisma.JsonNull;
+  }
+  return JSON.parse(
+    JSON.stringify(value, (_key, v: unknown) =>
+      typeof v === 'bigint' ? v.toString() : v,
+    ),
+  ) as Prisma.InputJsonValue;
+}
 
 @Injectable()
 export class TicketsService {
@@ -49,6 +64,7 @@ export class TicketsService {
     @Optional() private readonly promoCodes?: PromoCodesService,
     @Optional() private readonly gates?: GatesService,
     @Optional() private readonly audit?: AuditService,
+    @Optional() private readonly featureFlags?: FeatureFlagsService,
   ) {}
 
   // ---- Organizer-authorized issuance (off-chain payment already settled) ----
@@ -97,6 +113,8 @@ export class TicketsService {
     const { ticketType, event } =
       await this.getTicketTypeWithEvent(ticketTypeId);
     await this.organizations.assertMember(event.organizationId, userId);
+    const replay = await this.findProcessedTx<Ticket>(signedXdr);
+    if (replay) return replay.value;
     const toUser = await this.getUserWithWallet(toUserId);
     this.assertRecipientPublicKey(toUser.stellarPublicKey, toPublicKey);
     // #377 — the DB row must describe the ticket the chain will mint.
@@ -135,6 +153,8 @@ export class TicketsService {
           chainTicketId,
           seat,
           issuedTxHash: txHash,
+          signedXdr,
+          operation: 'issue',
         });
       });
     } catch (err) {
@@ -192,6 +212,8 @@ export class TicketsService {
   ) {
     const { ticketType, event } =
       await this.getTicketTypeWithEvent(ticketTypeId);
+    const replay = await this.findProcessedTx<Ticket>(signedXdr);
+    if (replay) return replay.value;
     const buyer = await this.getUserWithWallet(buyerId);
     // #377 — the DB row must describe the ticket the chain will mint.
     this.assertSignedInvocation(signedXdr, 'purchase_primary', [
@@ -203,7 +225,7 @@ export class TicketsService {
     // #211 — fail fast on duplicate assigned seats before touching the chain.
     await this.assertSeatAvailable(event.id, seat);
     const { result, txHash } =
-      await this.stellar.submitSignedTransaction(signedXdr);
+      await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
     const chainTicketId = result as bigint;
 
     let ticket;
@@ -229,6 +251,8 @@ export class TicketsService {
           chainTicketId,
           seat,
           issuedTxHash: txHash,
+          signedXdr,
+          operation: 'purchase',
         });
       });
     } catch (err) {
@@ -279,6 +303,8 @@ export class TicketsService {
     signedXdr: string,
   ) {
     const ticket = await this.getOwnedTicket(ticketId, userId);
+    const replay = await this.findProcessedTx<Ticket>(signedXdr);
+    if (replay) return replay.value;
     const toUser = await this.getUserWithWallet(toUserId);
     this.assertRecipientPublicKey(toUser.stellarPublicKey, toPublicKey);
     // #375 — reject a transfer signed to a different wallet than toUserId's
@@ -287,7 +313,7 @@ export class TicketsService {
       ['ticket', 1, ticket.chainTicketId],
       ['recipient', 2, toUser.stellarPublicKey],
     ]);
-    await this.stellar.submitSignedTransaction(signedXdr);
+    await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
 
     // #375 — the chain is the source of truth for ownership: only record
     // toUserId once the on-chain owner is confirmed to be their wallet.
@@ -306,10 +332,12 @@ export class TicketsService {
         where: { ticketId, status: ResaleListingStatus.ACTIVE },
         data: { status: ResaleListingStatus.CANCELLED },
       });
-      return tx.ticket.update({
+      const transferred = await tx.ticket.update({
         where: { id: ticketId },
         data: { ownerId: toUserId, status: TicketStatus.VALID },
       });
+      await this.recordProcessedTx(tx, signedXdr, 'transfer', transferred);
+      return transferred;
     });
   }
 
@@ -415,18 +443,28 @@ export class TicketsService {
     reason?: string,
   ) {
     const ticket = await this.loadTicketForOrganizer(userId, { id: ticketId });
+    const replay = await this.findProcessedTx<Ticket>(signedXdr);
+    if (replay) return replay.value;
+    this.assertSignedInvocation(signedXdr, 'check_in', [
+      ['organizer', 0, ticket.event.organization.stellarAccount],
+      ['ticket', 1, ticket.chainTicketId],
+    ]);
     if (gateId) {
       await this.gates!.assertBelongsToEvent(gateId, ticket.eventId);
     }
     await this.stellar.submitSignedTransaction(signedXdr);
-    return this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        status: TicketStatus.USED,
-        checkedInAt: new Date(),
-        checkedInGateId: gateId ?? null,
-        checkInReason: reason ?? null,
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const checkedIn = await tx.ticket.update({
+        where: { id: ticketId },
+        data: {
+          status: TicketStatus.USED,
+          checkedInAt: new Date(),
+          checkedInGateId: gateId ?? null,
+          checkInReason: reason ?? null,
+        },
+      });
+      await this.recordProcessedTx(tx, signedXdr, 'check-in', checkedIn);
+      return checkedIn;
     });
   }
 
@@ -443,18 +481,28 @@ export class TicketsService {
     reason?: string,
   ) {
     const ticket = await this.getTicketWithOrg(ticketId);
+    const replay = await this.findProcessedTx<Ticket>(signedXdr);
+    if (replay) return replay.value;
+    this.assertSignedInvocation(signedXdr, 'check_in', [
+      ['organizer', 0, ticket.event.organization.stellarAccount],
+      ['ticket', 1, ticket.chainTicketId],
+    ]);
     if (gateId) {
       await this.gates!.assertBelongsToEvent(gateId, ticket.eventId);
     }
     await this.stellar.submitSignedTransaction(signedXdr);
-    return this.prisma.ticket.update({
-      where: { id: ticketId },
-      data: {
-        status: TicketStatus.USED,
-        checkedInAt: new Date(),
-        checkedInGateId: gateId ?? null,
-        checkInReason: reason ?? null,
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const checkedIn = await tx.ticket.update({
+        where: { id: ticketId },
+        data: {
+          status: TicketStatus.USED,
+          checkedInAt: new Date(),
+          checkedInGateId: gateId ?? null,
+          checkInReason: reason ?? null,
+        },
+      });
+      await this.recordProcessedTx(tx, signedXdr, 'check-in', checkedIn);
+      return checkedIn;
     });
   }
 
@@ -472,18 +520,20 @@ export class TicketsService {
 
   async confirmRevoke(userId: string, ticketId: string, signedXdr: string) {
     const ticket = await this.loadTicketForOrganizer(userId, { id: ticketId });
+    const replay = await this.findProcessedTx<Ticket>(signedXdr);
+    if (replay) return replay.value;
+    this.assertSignedInvocation(signedXdr, 'revoke_ticket', [
+      ['organizer', 0, ticket.event.organization.stellarAccount],
+      ['ticket', 1, ticket.chainTicketId],
+    ]);
     await this.stellar.submitSignedTransaction(signedXdr);
     const revoked = await this.prisma.$transaction(async (tx) => {
-      // #379 — `revoke_ticket` zeroes the on-chain resale price, so a listing
-      // left ACTIVE would stay in the marketplace yet fail every purchase.
-      await tx.resaleListing.updateMany({
-        where: { ticketId, status: ResaleListingStatus.ACTIVE },
-        data: { status: ResaleListingStatus.CANCELLED },
-      });
-      return tx.ticket.update({
+      const row = await tx.ticket.update({
         where: { id: ticketId },
         data: { status: TicketStatus.REVOKED },
       });
+      await this.recordProcessedTx(tx, signedXdr, 'revoke', row);
+      return row;
     });
     // #209 — audit ticket revocation.
     await this.audit?.record(userId, 'ticket.revoke', 'Ticket', ticketId, {
@@ -604,6 +654,8 @@ export class TicketsService {
     signedXdr: string,
     expiresAt?: string,
   ) {
+    const replay = await this.findProcessedTx<ResaleListing>(signedXdr);
+    if (replay) return replay.value;
     await this.assertWithinResaleLimit(userId);
     // #216 — fail fast when the ticket is already listed before touching the
     // chain. The DB-level partial unique index remains the source of truth.
@@ -624,7 +676,7 @@ export class TicketsService {
       ['price', 2, BigInt(price)],
     ]);
 
-    const { txHash } = await this.stellar.submitSignedTransaction(signedXdr);
+    const { txHash } = await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
     // #376 — store the price the chain actually recorded, not the body's.
     const { resalePrice } = await this.stellar.verifyTicket(
       ticket.chainTicketId,
@@ -636,7 +688,7 @@ export class TicketsService {
           where: { id: ticketId },
           data: { status: TicketStatus.RESALE },
         });
-        return tx.resaleListing.create({
+        const listing = await tx.resaleListing.create({
           data: {
             ticketId,
             sellerId: userId,
@@ -650,6 +702,8 @@ export class TicketsService {
             },
           },
         });
+        await this.recordProcessedTx(tx, signedXdr, 'list-resale', listing);
+        return listing;
       });
     } catch (err) {
       // #216 — a concurrent create raced us past the pre-check: the partial
@@ -756,8 +810,14 @@ export class TicketsService {
     ticketId: string,
     signedXdr: string,
   ) {
-    await this.getOwnedTicket(ticketId, userId);
-    await this.stellar.submitSignedTransaction(signedXdr);
+    const ticket = await this.getOwnedTicket(ticketId, userId);
+    if (await this.findProcessedTx<null>(signedXdr)) return;
+    const owner = await this.getUserWithWallet(userId);
+    this.assertSignedInvocation(signedXdr, 'cancel_resale', [
+      ['owner', 0, owner.stellarPublicKey],
+      ['ticket', 1, ticket.chainTicketId],
+    ]);
+    await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
 
     return this.prisma.$transaction(async (tx) => {
       await tx.ticket.update({
@@ -768,6 +828,7 @@ export class TicketsService {
         where: { ticketId, status: ResaleListingStatus.ACTIVE },
         data: { status: ResaleListingStatus.CANCELLED },
       });
+      await this.recordProcessedTx(tx, signedXdr, 'cancel-resale', null);
     });
   }
 
@@ -786,17 +847,27 @@ export class TicketsService {
   }
 
   async confirmBuyResale(buyerId: string, ticketId: string, signedXdr: string) {
-    await this.stellar.submitSignedTransaction(signedXdr);
+    const ticket = await this.getTicketWithOrg(ticketId);
+    const replay = await this.findProcessedTx<Ticket>(signedXdr);
+    if (replay) return replay.value;
+    const buyer = await this.getUserWithWallet(buyerId);
+    this.assertSignedInvocation(signedXdr, 'buy_resale', [
+      ['buyer', 0, buyer.stellarPublicKey],
+      ['ticket', 1, ticket.chainTicketId],
+    ]);
+    await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
 
     return this.prisma.$transaction(async (tx) => {
       await tx.resaleListing.updateMany({
         where: { ticketId, status: ResaleListingStatus.ACTIVE },
         data: { status: ResaleListingStatus.SOLD },
       });
-      return tx.ticket.update({
+      const bought = await tx.ticket.update({
         where: { id: ticketId },
         data: { ownerId: buyerId, status: TicketStatus.VALID },
       });
+      await this.recordProcessedTx(tx, signedXdr, 'buy-resale', bought);
+      return bought;
     });
   }
 
@@ -883,13 +954,15 @@ export class TicketsService {
       chainTicketId: bigint;
       seat?: string;
       issuedTxHash: string;
+      signedXdr: string;
+      operation: string;
     },
   ) {
     await tx.ticketType.update({
       where: { id: params.ticketTypeId },
       data: { quantityIssued: { increment: 1 } },
     });
-    return tx.ticket.create({
+    const ticket = await tx.ticket.create({
       data: {
         eventId: params.eventId,
         ticketTypeId: params.ticketTypeId,
@@ -897,6 +970,57 @@ export class TicketsService {
         chainTicketId: params.chainTicketId,
         seat: params.seat ?? UNASSIGNED_SEAT,
         issuedTxHash: params.issuedTxHash,
+      },
+    });
+    await this.recordProcessedTx(
+      tx,
+      params.signedXdr,
+      params.operation,
+      ticket,
+    );
+    return ticket;
+  }
+
+  /**
+   * #161 — attendee actions are wrapped in a platform-paid fee bump when
+   * `FEATURE_FEE_BUMP` is on, so attendees don't need XLM for gas.
+   */
+  private attendeeSubmitOptions(): { sponsorFee: boolean } {
+    return { sponsorFee: this.featureFlags?.isEnabled('feeBump') ?? false };
+  }
+
+  /**
+   * #159 — returns the response recorded for this envelope, if it was already
+   * confirmed. Callers check it after the membership check and before any
+   * validation: a replayed ticket or listing already exists, so the seat and
+   * listing checks would otherwise 409 a request that already succeeded.
+   */
+  private async findProcessedTx<T>(
+    signedXdr: string,
+  ): Promise<{ value: T } | null> {
+    const row = await this.prisma.processedTx.findUnique({
+      where: { txHash: this.stellar.txHashOf(signedXdr) },
+    });
+    return row ? { value: row.response as T } : null;
+  }
+
+  /**
+   * #159 — records the response inside the caller's transaction, so the
+   * processed marker commits or rolls back together with the DB changes. A
+   * concurrent duplicate hits the `txHash` primary key and fails the whole
+   * transaction.
+   */
+  private recordProcessedTx(
+    tx: Prisma.TransactionClient,
+    signedXdr: string,
+    operation: string,
+    response: unknown,
+  ) {
+    return tx.processedTx.create({
+      data: {
+        txHash: this.stellar.txHashOf(signedXdr),
+        operation,
+        response: toStoredResponse(response),
       },
     });
   }
@@ -1116,7 +1240,7 @@ export class TicketsService {
    * #375/#376/#377 — decodes the signed envelope and checks it calls `fn`
    * with the values this request is about to record. Each `expected` entry
    * is a label, the argument's position in the contract call, and the value
-   * it must hold. A mismatch is a 409: the client signed something other
+   * it must hold. A mismatch is a 400: the client signed something other
    * than what it asked us to record.
    */
   private assertSignedInvocation(
@@ -1133,13 +1257,13 @@ export class TicketsService {
       );
     }
     if (invocation.functionName !== fn) {
-      throw new ConflictException(
+      throw new BadRequestException(
         `Signed transaction calls ${invocation.functionName}, expected ${fn}`,
       );
     }
     for (const [label, index, value] of expected) {
       if (invocation.args[index] !== value) {
-        throw new ConflictException(
+        throw new BadRequestException(
           `Signed transaction ${label} does not match the request`,
         );
       }
